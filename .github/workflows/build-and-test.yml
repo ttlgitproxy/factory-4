@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       job_id:
-        description: 'Dispatch state job ID (UUID from dispatch-state repo)'
+        description: 'Opaque dispatch job ID (UUID)'
         required: true
         type: string
 
@@ -31,22 +31,29 @@ jobs:
       - name: Parse dispatch payload
         env:
           PROXY_PAT: ${{ secrets.PROXY_PAT }}
+          DISPATCH_STATE_REPO: ${{ secrets.DISPATCH_STATE_REPO }}
           WORKFLOW_JOB_ID: ${{ github.event.inputs.job_id }}
         run: |
           set -euo pipefail
 
-          # Extract fallback fields from payload for status reporting if state fetch fails
-          fallback_project_id="$(jq -r '.client_payload.project_id // empty' "$GITHUB_EVENT_PATH")"
-          fallback_sha="$(jq -r '.client_payload.sha // empty' "$GITHUB_EVENT_PATH")"
-          set_fallback_env() {
-            if [ -n "$fallback_project_id" ] && printf '%s' "$fallback_project_id" | LC_ALL=C grep -Eq '^[0-9]+$'; then
-              echo "PROJECT_ID=$fallback_project_id" >> "$GITHUB_ENV"
-            fi
-            if [ -n "$fallback_sha" ] && printf '%s' "$fallback_sha" | LC_ALL=C grep -Eq '^[0-9a-f]{7,40}$'; then
-              echo "SHA=$fallback_sha" >> "$GITHUB_ENV"
-            fi
+          # The state repository name is private configuration; keep it out of workflow source and logs.
+          if [ -z "${DISPATCH_STATE_REPO:-}" ]; then
+            echo "DISPATCH_STATE_REPO secret is required"
+            exit 1
+          fi
+
+          if ! [[ "$DISPATCH_STATE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "DISPATCH_STATE_REPO secret must be in owner/name form"
+            exit 1
+          fi
+
+          # grep tests each line separately; reject multi-line values so a check covers the whole value.
+          matches_whole() {
+            case "$1" in *$'\n'*|*$'\r'*) return 1 ;; esac
+            printf '%s' "$1" | LC_ALL=C grep -Eq "$2"
           }
 
+          # Only the opaque job handle is read from the public dispatch payload.
           job_id="$(jq -r '.client_payload.job_id // empty' "$GITHUB_EVENT_PATH")"
           if [ -z "$job_id" ]; then
             job_id="$WORKFLOW_JOB_ID"
@@ -54,35 +61,121 @@ jobs:
 
           if [ -z "$job_id" ]; then
             echo "Missing job_id in dispatch payload"
-            set_fallback_env
             exit 1
           fi
 
-          if ! printf '%s' "$job_id" | LC_ALL=C grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+          if ! matches_whole "$job_id" '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
             echo "Invalid job_id format"
-            set_fallback_env
             exit 1
           fi
 
-          state_url="https://api.github.com/repos/ttlgitproxy/dispatch-state/contents/${job_id}.json"
+          state_url="https://api.github.com/repos/${DISPATCH_STATE_REPO}/contents/${job_id}.json"
 
-          state_response="$(curl --retry 3 --retry-delay 5 --retry-connrefused --max-time 30 -sS \
+          if [ -z "${PROXY_PAT:-}" ]; then
+            echo "PROXY_PAT secret is unset or empty — cannot authenticate to the dispatch state repository"
+            exit 1
+          fi
+
+          # The response body is private; keep it outside the workspace and never print it.
+          state_body_file="$RUNNER_TEMP/state-response.json"
+          trap 'rm -f "$state_body_file"' EXIT
+          curl_rc=0
+          http_status="$(curl --retry 3 --retry-delay 5 --retry-connrefused --max-time 30 -sS \
             -H "Authorization: token ${PROXY_PAT}" \
             -H "Accept: application/vnd.github.v3+json" \
-            "$state_url")"
+            -o "$state_body_file" \
+            -w '%{http_code}' \
+            "$state_url")" || curl_rc=$?
 
-          file_sha="$(printf '%s' "$state_response" | jq -r '.sha // empty')"
-          encoded_content="$(printf '%s' "$state_response" | jq -r '.content // empty')"
+          if [ "$http_status" = "000" ]; then
+            echo "Dispatch state fetch did not complete (transport/DNS failure; HTTP 000) — check network and re-run."
+            exit 1
+          elif [ "$curl_rc" -ne 0 ]; then
+            echo "Dispatch state fetch returned HTTP ${http_status} but transfer did not complete (curl exit ${curl_rc}) — response body may be truncated. This is not a confirmed token or permission failure; check network stability and re-run."
+            exit 1
+          elif [ "$http_status" = "401" ]; then
+            echo "Dispatch state fetch returned HTTP 401 — PROXY_PAT secret is stale or revoked. Rotate the secret."
+            exit 1
+          elif [ "$http_status" = "403" ]; then
+            # Distinguish rate-limit (transient) from permission denial (credential problem) without echoing the body.
+            if [ -f "$state_body_file" ] && LC_ALL=C grep -qi "rate limit" "$state_body_file" 2>/dev/null; then
+              echo "Dispatch state fetch returned HTTP 403 — GitHub rate limit exceeded. This is transient; re-run the workflow."
+            else
+              echo "Dispatch state fetch returned HTTP 403 — PROXY_PAT may lack contents:read on the dispatch state repository, but this status also occurs from WAF/proxy blocks, organization IP-allowlist enforcement, or SAML/SSO requirements. Check PAT scopes and org settings before rotating the secret."
+            fi
+            exit 1
+          elif [ "$http_status" = "429" ]; then
+            echo "Dispatch state fetch returned HTTP 429 — GitHub rate limit exceeded. This is transient; re-run the workflow."
+            exit 1
+          elif [ "$http_status" = "404" ]; then
+            probe_rc=0
+            probe_status="$(curl --max-time 10 -sS \
+              -H "Authorization: token ${PROXY_PAT}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              -o /dev/null -w '%{http_code}' \
+              "https://api.github.com/repos/${DISPATCH_STATE_REPO}/contents/")" || probe_rc=$?
+            if [ "$probe_rc" -ne 0 ] && [ "$probe_status" != "000" ]; then
+              echo "Dispatch state file not found (HTTP 404) for job ${job_id} — contents probe returned HTTP ${probe_status} but transfer did not complete (curl exit ${probe_rc}). Cause is ambiguous; check network stability and re-run."
+            elif [ "$probe_status" = "200" ]; then
+              echo "Dispatch state file not found (HTTP 404) for job ${job_id} — PROXY_PAT can read the repo contents; file was never written or was already consumed. Check that the dispatch workflow uploaded the state file before triggering this run."
+            elif [ "$probe_status" = "000" ]; then
+              echo "Dispatch state file not found (HTTP 404) for job ${job_id} — contents probe did not complete (transport/DNS failure; HTTP 000). Cause is ambiguous: file may be missing/consumed, or PROXY_PAT may lack access. Check PAT scopes and re-run."
+            elif [ "$probe_status" = "429" ]; then
+              echo "Dispatch state file not found (HTTP 404) for job ${job_id} — contents probe returned HTTP 429 (rate limit). Cause is ambiguous; re-run the workflow."
+            elif [ "$(printf '%s' "$probe_status" | LC_ALL=C cut -c1)" = "5" ]; then
+              echo "Dispatch state file not found (HTTP 404) for job ${job_id} — contents probe returned HTTP ${probe_status} (GitHub service failure). This is transient; re-run the workflow."
+            elif [ "$probe_status" = "401" ]; then
+              echo "Dispatch state fetch returned HTTP 404 for job ${job_id}, and contents probe returned HTTP 401 — PROXY_PAT is invalid or expired. Rotate PROXY_PAT."
+            else
+              echo "Dispatch state fetch returned HTTP 404 for job ${job_id}, and contents probe returned HTTP ${probe_status} — cause is not confirmed; PROXY_PAT may lack contents:read, or an org/SSO/IP policy may be blocking access. Check PAT scopes and org settings before rotating."
+            fi
+            exit 1
+          elif [ "$(printf '%s' "$http_status" | LC_ALL=C cut -c1)" = "5" ]; then
+            echo "Dispatch state fetch returned HTTP ${http_status} — GitHub service failure. This is transient; re-run the workflow."
+            exit 1
+          elif [ "$http_status" != "200" ]; then
+            echo "Dispatch state fetch returned unexpected HTTP ${http_status} for job ${job_id}"
+            exit 1
+          fi
+
+          state_response="$(cat "$state_body_file")" || {
+            echo "Failed to read dispatch state response file for job ${job_id} — unexpected I/O error"
+            exit 1
+          }
+          rm -f "$state_body_file"
+          trap - EXIT
+
+          file_sha="$(printf '%s' "$state_response" | jq -r '.sha // empty' 2>/dev/null)" || {
+            echo "Failed to parse .sha from dispatch state response for job ${job_id} — body may be non-JSON or malformed"
+            exit 1
+          }
+          encoded_content="$(printf '%s' "$state_response" | jq -r '.content // empty' 2>/dev/null)" || {
+            echo "Failed to parse .content from dispatch state response for job ${job_id} — body may be non-JSON or malformed"
+            exit 1
+          }
 
           if [ -z "$file_sha" ] || [ -z "$encoded_content" ]; then
-            echo "Failed to fetch dispatch state for job ${job_id}"
-            set_fallback_env
+            echo "Dispatch state response missing .sha or .content fields for job ${job_id} — unexpected API response shape"
+            exit 1
+          fi
+
+          if ! matches_whole "$file_sha" '^[0-9a-f]{40}([0-9a-f]{24})?$'; then
+            echo "Dispatch state response has an invalid .sha for job ${job_id}"
             exit 1
           fi
 
           echo "::add-mask::$file_sha"
 
-          state_json="$(printf '%s' "$encoded_content" | tr -d '\n' | /usr/bin/base64 -D)"
+          state_json="$(printf '%s' "$encoded_content" | tr -d '\n' | /usr/bin/base64 -D 2>/dev/null)" || {
+            echo "Failed to decode .content field for job ${job_id} — field was not valid base64. Response body may be malformed or proxy-modified."
+            exit 1
+          }
+
+          if ! printf '%s' "$state_json" | jq -e 'type == "object"' >/dev/null 2>&1; then
+            state_json_type="$(printf '%s' "$state_json" | jq -r 'type' 2>/dev/null || echo 'unknown')"
+            echo "Decoded .content for job ${job_id} is not a JSON object (got type: ${state_json_type}) — dispatch state payload was malformed or proxy-modified. Check that the dispatch workflow wrote a valid state file."
+            exit 1
+          fi
 
           ref="$(printf '%s' "$state_json" | jq -r '.ref // empty')"
           sha="$(printf '%s' "$state_json" | jq -r '.sha // empty')"
@@ -92,7 +185,6 @@ jobs:
           event_type="$(printf '%s' "$state_json" | jq -r '.event_type // empty')"
           if [ "$event_type" != "build-and-test" ]; then
             echo "State file event_type mismatch (expected build-and-test)"
-            set_fallback_env
             exit 1
           fi
 
@@ -110,31 +202,26 @@ jobs:
 
           if [ -z "$ref" ] || [ -z "$sha" ]; then
             echo "Missing ref or sha in dispatch state"
-            set_fallback_env
             exit 1
           fi
 
-          if ! printf '%s' "$ref" | LC_ALL=C grep -Eq '^[A-Za-z0-9._/-]+$'; then
+          if ! matches_whole "$ref" '^[A-Za-z0-9._/-]+$'; then
             echo "Invalid ref format"
-            set_fallback_env
             exit 1
           fi
 
-          if ! printf '%s' "$sha" | LC_ALL=C grep -Eq '^[0-9a-f]{7,40}$'; then
+          if ! matches_whole "$sha" '^[0-9a-f]{7,40}$'; then
             echo "Invalid sha format"
-            set_fallback_env
             exit 1
           fi
 
-          if [ -n "$project_id" ] && ! printf '%s' "$project_id" | LC_ALL=C grep -Eq '^[0-9]+$'; then
+          if [ -n "$project_id" ] && ! matches_whole "$project_id" '^[0-9]+$'; then
             echo "Invalid project_id format"
-            set_fallback_env
             exit 1
           fi
 
-          if [ -n "$merge_request_iid" ] && ! printf '%s' "$merge_request_iid" | LC_ALL=C grep -Eq '^[0-9]+$'; then
+          if [ -n "$merge_request_iid" ] && ! matches_whole "$merge_request_iid" '^[0-9]+$'; then
             echo "Invalid merge_request_iid format"
-            set_fallback_env
             exit 1
           fi
 
@@ -190,6 +277,7 @@ jobs:
       - name: Prefetch Danger base ref, then scrub clone credential (hardening)
         working-directory: source
         run: |
+          set -euo pipefail
           # Fetch the Danger base ref WHILE the clone credential is still present…
           export DANGER_BASE_REF="${DANGER_BASE_REF:-main}"
           git fetch --depth=100 origin "$DANGER_BASE_REF" 2>/dev/null || \
@@ -237,13 +325,6 @@ jobs:
 
           sudo xcode-select -s "$xcode_path/Contents/Developer"
           xcodebuild -version
-
-      - name: Cache DerivedData
-        uses: actions/cache@v4
-        with:
-          path: ~/Library/Developer/Xcode/DerivedData
-          key: ${{ runner.os }}-deriveddata-${{ hashFiles('source/**/*.swift', 'source/project.yml') }}
-          restore-keys: ${{ runner.os }}-deriveddata-
 
       - name: Install XcodeGen
         run: |
@@ -307,7 +388,7 @@ jobs:
             exit 0
           fi
           PERI_OUTPUT=$(periphery scan 2>/dev/null || true)
-          PERI_COUNT=$(printf '%s' "$PERI_OUTPUT" | grep -c '\.swift:' || echo "0")
+          PERI_COUNT=$(printf '%s' "$PERI_OUTPUT" | LC_ALL=C grep -c '\.swift:' || echo "0")
           echo "📊 Periphery: ${PERI_COUNT} dead-code findings (advisory — non-blocking)"
 
       - name: Danger changeset rules (advisory)
@@ -321,11 +402,12 @@ jobs:
             exit 0
           fi
           DANGER_RESULT=0
-          danger-swift local --base "origin/${DANGER_BASE_REF}" 2>/dev/null || DANGER_RESULT=$?
+          # Danger's report quotes private file names and messages; keep it out of the public log.
+          danger-swift local --base "origin/${DANGER_BASE_REF}" >/dev/null 2>&1 || DANGER_RESULT=$?
           if [ "$DANGER_RESULT" -eq 0 ]; then
             echo "✅ Danger: all changeset rules passed (advisory)"
           else
-            echo "📊 Danger: changeset rule violations found above (advisory — non-blocking)"
+            echo "📊 Danger: changeset check failed (advisory — non-blocking; details withheld)"
           fi
 
       # ── End quality gates ─────────────────────────────────────────────────
@@ -366,7 +448,14 @@ jobs:
             exit 1
           fi
 
-          if ! printf '%s' "$simulator_id" | grep -Eq '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$'; then
+          # grep tests each line separately; reject multi-line values so the check covers the whole value.
+          case "$simulator_id" in
+            *$'\n'*|*$'\r'*)
+              echo "simulator_id is not a valid UUID"
+              exit 1
+              ;;
+          esac
+          if ! printf '%s' "$simulator_id" | LC_ALL=C grep -Eq '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$'; then
             echo "simulator_id is not a valid UUID"
             exit 1
           fi
@@ -382,6 +471,8 @@ jobs:
 
       - name: Build
         working-directory: source
+        env:
+          SIMULATOR_ID: ${{ steps.simulator.outputs.id }}
         run: |
           set -euo pipefail
           set -o pipefail
@@ -393,7 +484,7 @@ jobs:
 
           xcodebuild build \
             -scheme "$SCHEME_NAME" \
-            -destination "platform=iOS Simulator,id=${{ steps.simulator.outputs.id }}" \
+            -destination "platform=iOS Simulator,id=${SIMULATOR_ID}" \
             -configuration Debug \
             CODE_SIGN_IDENTITY= \
             CODE_SIGNING_REQUIRED=NO \
@@ -402,13 +493,15 @@ jobs:
 
       - name: Test
         working-directory: source
+        env:
+          SIMULATOR_ID: ${{ steps.simulator.outputs.id }}
         run: |
           set -euo pipefail
           set -o pipefail
 
           xcodebuild test \
             -scheme "$SCHEME_NAME" \
-            -destination "platform=iOS Simulator,id=${{ steps.simulator.outputs.id }}" \
+            -destination "platform=iOS Simulator,id=${SIMULATOR_ID}" \
             -configuration Debug \
             CODE_SIGN_IDENTITY= \
             CODE_SIGNING_REQUIRED=NO \
@@ -416,11 +509,26 @@ jobs:
             -resultBundlePath TestResults.xcresult \
             2>&1 | tee test.log > /dev/null
 
+      # A sanitizer error must not turn a passing build into a failure report.
+      # The excerpt file is removed first and only written after every filter
+      # succeeds, so a failure means no excerpt is attached, never raw log text.
       - name: Sanitize log excerpt
         if: always()
-        working-directory: source
+        continue-on-error: true
         run: |
           set -euo pipefail
+
+          if [ ! -d source ]; then
+            mkdir -p source
+            printf '%s' 'No log: source was not cloned' > source/sanitized-log.txt
+            exit 0
+          fi
+          cd source
+
+          sanitized_log_path="$(pwd)/sanitized-log.txt"
+          sanitized_tmp_path="${sanitized_log_path}.tmp"
+          rm -f "$sanitized_log_path" "$sanitized_tmp_path"
+          trap 'rm -f "$sanitized_tmp_path"' EXIT
 
           log_file=""
           if [ -f test.log ]; then
@@ -429,19 +537,20 @@ jobs:
             log_file="build.log"
           fi
 
-          sanitized_log_path="$(pwd)/sanitized-log.txt"
-
           if [ -z "$log_file" ]; then
             printf '%s' 'No log file found' > "$sanitized_log_path"
             exit 0
           fi
 
+          # LC_ALL=C: under a UTF-8 locale macOS BSD tools reject invalid byte
+          # sequences and some bracket ranges, and path redaction can stop at a
+          # bad byte. Byte-wise matching avoids both.
           # Always capture test summary lines (suite/run results, not per-case)
-          test_results="$(grep -E 'Test Suite|Executed|BUILD SUCCEEDED|✘|✔|Test run with|Suite .*passed|Suite .*failed|Test .*failed|Issue recorded' "$log_file" || true)"
+          test_results="$(LC_ALL=C grep -E 'Test Suite|Executed|BUILD SUCCEEDED|✘|✔|Test run with|Suite .*passed|Suite .*failed|Test .*failed|Issue recorded' "$log_file" || true)"
           if [ "${{ job.status }}" != "success" ]; then
             # On failure, also capture error details
-            error_details="$(grep -E '\[!\]|error:|FAILED|fatal|Could not|BUILD FAILED|TEST FAILED|ARCHIVE FAILED|undefined symbol|linker error|linker command failed|ld:|cannot find' "$log_file" || true)"
-            extracted="$(printf '%s\n%s' "$error_details" "$test_results" | awk '!seen[$0]++')"
+            error_details="$(LC_ALL=C grep -E '\[!\]|error:|FAILED|fatal|Could not|BUILD FAILED|TEST FAILED|ARCHIVE FAILED|undefined symbol|linker error|linker command failed|ld:|cannot find' "$log_file" || true)"
+            extracted="$(printf '%s\n%s' "$error_details" "$test_results" | LC_ALL=C awk '!seen[$0]++')"
           else
             extracted="$test_results"
           fi
@@ -450,7 +559,7 @@ jobs:
             extracted='(no matching log lines captured)'
           fi
 
-          sanitized="$(printf '%s' "$extracted" | sed -E \
+          sanitized="$(printf '%s' "$extracted" | LC_ALL=C sed -E \
             -e 's#/Users/[^ "\\]*#<path>#g' \
             -e 's#/private/var/[^ "\\]*#<path>#g' \
             -e 's#/var/folders/[^ "\\]*#<path>#g' \
@@ -462,13 +571,15 @@ jobs:
             -e 's#PROVISIONING_PROFILE[^ =]*=[^ " )]*#PROVISIONING_PROFILE=<redacted>#g' \
             -e 's#DEVELOPMENT_TEAM *= *[^ " )]*#DEVELOPMENT_TEAM=<redacted>#g')"
 
-          sanitized="$(printf '%s' "$sanitized" | tr '`' "'")"
+          sanitized="$(printf '%s' "$sanitized" | LC_ALL=C tr '`' "'")"
           if [ -n "$SCHEME_NAME" ]; then sanitized="${sanitized//$SCHEME_NAME/[SCHEME]}"; fi
           if [ -n "$BUNDLE_ID" ]; then sanitized="${sanitized//$BUNDLE_ID/<bundle-id>}"; fi
           if [ -n "$TEAM_ID" ]; then sanitized="${sanitized//$TEAM_ID/<team-id>}"; fi
-          sanitized="$(printf '%s' "$sanitized" | head -60 | head -c 8192 | sed 's/__SANITIZED_EOF__/[REDACTED]/g')"
+          # Readers consume all input so a long excerpt cannot SIGPIPE the pipeline.
+          sanitized="$(printf '%s' "$sanitized" | LC_ALL=C awk 'NR <= 60' | { head -c 8192; cat > /dev/null; } | LC_ALL=C sed 's/__SANITIZED_EOF__/[REDACTED]/g')"
 
-          printf '%s' "$sanitized" > "$sanitized_log_path"
+          printf '%s' "$sanitized" > "$sanitized_tmp_path"
+          mv -f "$sanitized_tmp_path" "$sanitized_log_path"
 
       - name: Report success status
         if: success()
@@ -505,7 +616,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ -z "$PROJECT_ID" ] || [ -z "${SHA:-}" ]; then
+          if [ -z "${PROJECT_ID:-}" ] || [ -z "${SHA:-}" ]; then
             echo "No project id or sha provided; skipping failure status update"
             exit 0
           fi
@@ -553,7 +664,8 @@ jobs:
 
           sanitized_excerpt = ""
           if log_path.exists() and not log_path.is_symlink() and log_path.is_file():
-              sanitized_excerpt = log_path.read_text(encoding="utf-8")
+              # The byte-wise sanitizer can pass through or truncate inside non-UTF-8 sequences.
+              sanitized_excerpt = log_path.read_text(encoding="utf-8", errors="replace")
               sanitized_excerpt = "\n".join(sanitized_excerpt.splitlines()[:60])
               sanitized_excerpt = sanitized_excerpt.encode("utf-8")[:8192].decode("utf-8", errors="ignore")
 
@@ -611,7 +723,8 @@ jobs:
 
           sanitized_excerpt = ""
           if log_path.exists() and not log_path.is_symlink() and log_path.is_file():
-              sanitized_excerpt = log_path.read_text(encoding="utf-8")
+              # The byte-wise sanitizer can pass through or truncate inside non-UTF-8 sequences.
+              sanitized_excerpt = log_path.read_text(encoding="utf-8", errors="replace")
               sanitized_excerpt = "\n".join(sanitized_excerpt.splitlines()[:60])
               sanitized_excerpt = sanitized_excerpt.encode("utf-8")[:8192].decode("utf-8", errors="ignore")
 
