@@ -515,6 +515,7 @@ jobs:
       - name: Sanitize log excerpt
         if: always()
         continue-on-error: true
+        timeout-minutes: 5
         run: |
           set -euo pipefail
 
@@ -547,10 +548,151 @@ jobs:
           # bad byte. Byte-wise matching avoids both.
           # Always capture test summary lines (suite/run results, not per-case)
           test_results="$(LC_ALL=C grep -E 'Test Suite|Executed|BUILD SUCCEEDED|✘|✔|Test run with|Suite .*passed|Suite .*failed|Test .*failed|Issue recorded' "$log_file" || true)"
+          # "ld:" is anchored so "xcodebuild: WARNING ..." is not taken for a linker error.
+          error_pattern='\[!\]|error:|FAILED|fatal|Could not|BUILD FAILED|TEST FAILED|ARCHIVE FAILED|undefined symbol|linker error|linker command failed|(^| )ld:|cannot find'
           if [ "${{ job.status }}" != "success" ]; then
-            # On failure, also capture error details
-            error_details="$(LC_ALL=C grep -E '\[!\]|error:|FAILED|fatal|Could not|BUILD FAILED|TEST FAILED|ARCHIVE FAILED|undefined symbol|linker error|linker command failed|ld:|cannot find' "$log_file" || true)"
-            extracted="$(printf '%s\n%s' "$error_details" "$test_results" | LC_ALL=C awk '!seen[$0]++')"
+            # On failure, list compiler errors with their source context and failing tests
+            # with their reasons before summaries, dropping per-test pass lines so they
+            # cannot crowd failures out of the 60-line excerpt. The grep below is the
+            # fallback if python3 is unavailable or fails.
+            if ! extracted="$(python3 - "$log_file" "$error_pattern" 2>/dev/null <<'PY'
+          import re
+          import sys
+
+          PASS, FAIL, PROGRESS, SKIP = "\u2714", "\u2718", "\u25c7", "\u279c"
+          DETAIL_PREFIXES = ("\u21b3", "\u00b1")
+          MAX_DETAIL_LINES = 5
+          # Source line, caret and fix-it for an error, plus a note with its own context.
+          MAX_CONTEXT_LINES = 6
+          MAX_UNFINISHED = 10
+          MAX_LINES, MAX_BYTES = 60, 7680
+          # Only the start of a line is classified, so one huge line cannot stall the regexes.
+          MAX_SCAN = 4096
+
+          with open(sys.argv[1], "rb") as handle:
+              text = handle.read().decode("utf-8", "surrogateescape")
+          lines = [line[:-1] if line.endswith("\r") else line for line in text.split("\n")]
+
+          error_re = re.compile(sys.argv[2])
+          failure_re = re.compile(
+              r"Test .*failed|Suite .*failed|Issue recorded|Fatal error|crashed"
+              r"|unexpected exit|encountered an error|execution time allowance|timed out"
+              r"|^\([0-9]+ failures?\)$"
+          )
+          block_re = re.compile(r"(Failing tests|Testing failed|The following build commands failed):$")
+          # Compiler diagnostics carry a column ("File.swift:12:5: error: ..."); XCTest and
+          # runtime failures ("File.swift:12: error: ...") do not, and are not followed by source.
+          diagnostic_re = re.compile(r":[0-9]+:[0-9]+: (error|warning|note|remark): ")
+          summary_re = re.compile(
+              r"Test Suite|Executed|BUILD SUCCEEDED|Test run with|Suite .*passed|Suite .*failed"
+          )
+          started_re = re.compile(PROGRESS + r" Test (?!run started\.$)(.+) started\.$")
+          finished_re = re.compile(
+              "(?:" + PASS + "|" + FAIL + "|" + SKIP + r") Test (.+) "
+              r"(?:(?:passed|failed) after [0-9]|skipped[.:])"
+          )
+          run_finished_re = re.compile(
+              "(?:" + PASS + "|" + FAIL + r") Test run with .* (?:passed|failed) after "
+          )
+
+          selected, chosen, seen = [], set(), set()
+
+
+          def take(index, dedupe=True):
+              line = lines[index]
+              if index in chosen or (dedupe and line in seen):
+                  return False
+              seen.add(line)
+              chosen.add(index)
+              selected.append(line)
+              return True
+
+
+          def is_progress(line):
+              return line.lstrip().startswith((PASS, PROGRESS, SKIP))
+
+
+          def severity(line):
+              match = diagnostic_re.search(line)
+              return match.group(1) if match else None
+
+
+          detail_budget, context_budget, in_block = 0, 0, False
+          for index, line in enumerate(lines):
+              if not line.strip():
+                  detail_budget, context_budget, in_block = 0, 0, False
+                  continue
+              if in_block and line.startswith((" ", "\t")):
+                  take(index)
+                  continue
+              in_block = False
+              probe = line[:MAX_SCAN]
+              if detail_budget and line.startswith(DETAIL_PREFIXES):
+                  take(index, dedupe=False)
+                  detail_budget -= 1
+                  continue
+              detail_budget = 0
+              if context_budget and severity(probe) in (None, "note"):
+                  take(index, dedupe=False)
+                  context_budget -= 1
+                  continue
+              context_budget = 0
+              if block_re.match(probe):
+                  take(index)
+                  in_block = True
+              elif is_progress(line):
+                  continue
+              elif line.lstrip().startswith(FAIL):
+                  if take(index):
+                      detail_budget = MAX_DETAIL_LINES
+              elif error_re.search(probe) or failure_re.search(probe):
+                  if take(index) and severity(probe) == "error":
+                      context_budget = MAX_CONTEXT_LINES
+
+          # Swift Testing tests that started but never finished point at a crash or hang.
+          if not any(run_finished_re.match(line) for line in lines):
+              running = {}
+              for index, line in enumerate(lines):
+                  started = started_re.match(line)
+                  if started:
+                      running[started.group(1)] = index
+                      continue
+                  finished = finished_re.match(line)
+                  if finished:
+                      running.pop(finished.group(1), None)
+              if running:
+                  selected.append("Tests started but not finished (possible crash or hang):")
+                  for index in sorted(running.values())[:MAX_UNFINISHED]:
+                      take(index)
+
+          for index, line in enumerate(lines):
+              if summary_re.search(line[:MAX_SCAN]) and not is_progress(line):
+                  take(index)
+
+
+          # Keep whole lines with byte headroom so the cap applied after sanitizing
+          # rarely splits a multi-byte character.
+          def fit(limit):
+              output, size = [], 0
+              for line in selected[:limit]:
+                  size += len(line.encode("utf-8", "surrogateescape")) + 1
+                  if output and size > MAX_BYTES:
+                      break
+                  output.append(line)
+              return output
+
+
+          output = fit(MAX_LINES)
+          if len(output) < len(selected):
+              output = fit(MAX_LINES - 1)
+              output.append("... %d more lines not shown" % (len(selected) - len(output)))
+
+          sys.stdout.buffer.write("\n".join(output).encode("utf-8", "surrogateescape"))
+          PY
+            )"; then
+              error_details="$(LC_ALL=C grep -E "$error_pattern" "$log_file" || true)"
+              extracted="$(printf '%s\n%s' "$error_details" "$test_results" | LC_ALL=C awk '!seen[$0]++')"
+            fi
           else
             extracted="$test_results"
           fi
@@ -559,7 +701,10 @@ jobs:
             extracted='(no matching log lines captured)'
           fi
 
+          # Paths inside the checkout become repo-relative so file:line:column survives;
+          # every other absolute path is still redacted whole.
           sanitized="$(printf '%s' "$extracted" | LC_ALL=C sed -E \
+            -e 's#/Users/[^/ "\\]+/work/[^/ "\\]+/[^/ "\\]+/source/##g' \
             -e 's#/Users/[^ "\\]*#<path>#g' \
             -e 's#/private/var/[^ "\\]*#<path>#g' \
             -e 's#/var/folders/[^ "\\]*#<path>#g' \
