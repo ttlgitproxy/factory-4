@@ -20,6 +20,7 @@ BUILD = WORKFLOWS / "build-and-test.yml"
 DEPLOY = WORKFLOWS / "deploy-testflight.yml"
 ANSI_STRIP = "LC_ALL=C sed -E $'s/\\033\\\\[[0-?]*[ -/]*[@-~]//g'"
 EXCERPT_FILE = 'excerpt_file="$RUNNER_TEMP/deploy-log-excerpt.txt"'
+METADATA_FILE = 'metadata_file="$RUNNER_TEMP/deploy-metadata.json"'
 
 # Synthetic stand-ins for private configuration; none of these may reach step output.
 STATE_REPO = "synthetic-owner/synthetic-state-store"
@@ -689,17 +690,61 @@ class DeployFailureReportingBehaviourTests(unittest.TestCase):
 
 class DeployMetadataTests(unittest.TestCase):
     def setUp(self):
-        self.step = steps(read(DEPLOY))["Extract deploy metadata"]
+        self.workflow = read(DEPLOY)
+        self.step = steps(self.workflow)["Extract deploy metadata"]
 
-    def test_values_are_masked_before_environment_export(self):
-        for variable, exported in (("build_number", "BUILD_NUMBER"), ("version", "VERSION")):
-            self.assertLess(
-                self.step.index(f'echo "::add-mask::${variable}"'),
-                self.step.index(f'echo "{exported}<<'),
-            )
-        for line in self.step.splitlines():
-            if "echo" in line and re.search(r"\$\{?(build_number|version)\b", line):
-                self.assertIn("::add-mask::", line)
+    def test_public_release_metadata_is_not_registered_as_a_mask(self):
+        self.assertNotIn('::add-mask::$build_number', self.step)
+        self.assertNotIn('::add-mask::$version', self.step)
+
+    def test_public_release_metadata_uses_a_private_file_not_github_env(self):
+        self.assertNotIn("BUILD_NUMBER<<", self.step)
+        self.assertNotIn("VERSION<<", self.step)
+        self.assertIn(METADATA_FILE, self.step)
+        self.assertIn('umask 077', self.step)
+        self.assertIn('mktemp "$RUNNER_TEMP/deploy-metadata.XXXXXX"', self.step)
+        self.assertIn('chmod 600 "$metadata_temp"', self.step)
+        self.assertIn("jq -n \\", self.step)
+        self.assertLess(self.step.index('mv "$metadata_temp" "$metadata_file"'),
+                        self.step.index('echo "DEPLOY_ERROR<<'))
+
+    def test_metadata_consumers_parse_and_revalidate_private_json(self):
+        workflow_steps = steps(self.workflow)
+        consumers = (
+            workflow_steps["Report success status"],
+            workflow_steps["Comment on source commit"],
+        )
+        for consumer in consumers:
+            with self.subTest(step=consumer.splitlines()[0]):
+                self.assertIn(METADATA_FILE, consumer)
+                self.assertIn('[ -f "$metadata_file" ] && [ ! -L "$metadata_file" ]', consumer)
+                self.assertIn("jq -er '.version | select(type == \"string\")'", consumer)
+                self.assertIn("jq -er '.build_number | select(type == \"string\")'", consumer)
+                self.assertIn("^[0-9]+(\\.[0-9]+){1,2}$", consumer)
+                self.assertIn("''|*[!0-9]*)", consumer)
+                self.assertNotRegex(consumer, r"\$\{?(VERSION|BUILD_NUMBER)\b")
+
+    def test_cleanup_removes_metadata_and_partial_files(self):
+        cleanup = steps(self.workflow)["Clean up"]
+        self.assertIn('"$RUNNER_TEMP/deploy-metadata.json"', cleanup)
+        self.assertIn('"$RUNNER_TEMP"/deploy-metadata.??????', cleanup)
+
+    def test_private_identifiers_and_signing_metadata_remain_masked(self):
+        for value in (
+            "$SOURCE_REPOSITORY_URL",
+            "${PROJECT_ID}",
+            "${SHA:0:12}",
+            "${REF}",
+            "$keychain_password",
+            "$profile_uuid",
+            "$profile_name",
+            "$profile_app_id",
+            "$expiration_date",
+            "$ASC_KEY_ID",
+            "$ASC_ISSUER_ID",
+        ):
+            with self.subTest(value=value):
+                self.assertIn(f'echo "::add-mask::{value}"', self.workflow)
 
     def test_loose_raw_log_patterns_are_gone(self):
         self.assertNotIn("Incrementing build number", self.step)
@@ -775,7 +820,8 @@ class DeployMetadataTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, ascii(result.stderr))
         self.assertFalse((runner_temp / "read-ipa-version.py").exists())
         env_text = github_env.read_bytes().decode("utf-8", errors="surrogateescape")
-        return result.stdout, parse_env_file(env_text)
+        metadata = json.loads((runner_temp / "deploy-metadata.json").read_text(encoding="utf-8"))
+        return result.stdout, parse_env_file(env_text), metadata
 
     def assert_only_masked(self, stdout, *values):
         for value in values:
@@ -785,7 +831,7 @@ class DeployMetadataTests(unittest.TestCase):
                     self.assertTrue(line.startswith("::add-mask::"), line)
 
     def test_metadata_comes_from_exported_ipa(self):
-        stdout, env = self.run_metadata(
+        stdout, env, metadata = self.run_metadata(
             deploy_log=(
                 b"[12:00:00]: fastlane 2.999.0\n"
                 b"[12:00:01]: $ cd /synthetic && agvtool new-version -all 111 && cd -\n"
@@ -798,11 +844,14 @@ class DeployMetadataTests(unittest.TestCase):
                 ),
             ),
         )
-        self.assertEqual((env["VERSION"], env["BUILD_NUMBER"]), ("3.4.5", "678"))
-        self.assert_only_masked(stdout, "3.4.5", "678")
+        self.assertNotIn("VERSION", env)
+        self.assertNotIn("BUILD_NUMBER", env)
+        self.assertEqual((metadata["version"], metadata["build_number"]), ("3.4.5", "678"))
+        self.assertNotIn("::add-mask::3.4.5", stdout)
+        self.assertNotIn("::add-mask::678", stdout)
 
     def test_build_number_falls_back_to_anchored_agvtool_line(self):
-        stdout, env = self.run_metadata(
+        stdout, env, metadata = self.run_metadata(
             deploy_log=(
                 b"[12:00:00]: fastlane 2.999.0\n"
                 b"[12:00:01]: Latest upload for version 2.0.1 is build: 41\n"
@@ -810,16 +859,22 @@ class DeployMetadataTests(unittest.TestCase):
                 b"[12:00:03]: build_number 777 \xff\xfe\n"
             )
         )
-        self.assertEqual((env["VERSION"], env["BUILD_NUMBER"]), ("unknown", "42"))
-        self.assert_only_masked(stdout, "42")
+        self.assertNotIn("VERSION", env)
+        self.assertNotIn("BUILD_NUMBER", env)
+        self.assertEqual((metadata["version"], metadata["build_number"]), ("unknown", "42"))
+        self.assertNotIn("::add-mask::42", stdout)
         self.assertNotIn("::add-mask::unknown", stdout)
 
     def test_invalid_ipa_values_are_rejected(self):
-        stdout, env = self.run_metadata(
+        stdout, env, metadata = self.run_metadata(
             deploy_log=b"[12:00:00]: fastlane 2.999.0\n",
             plist={"CFBundleShortVersionString": "1.2.3.4", "CFBundleVersion": "12a"},
         )
-        self.assertEqual((env["VERSION"], env["BUILD_NUMBER"]), ("unknown", "unknown"))
+        self.assertNotIn("VERSION", env)
+        self.assertNotIn("BUILD_NUMBER", env)
+        self.assertEqual(
+            (metadata["version"], metadata["build_number"]), ("unknown", "unknown")
+        )
         self.assertNotIn("::add-mask::", stdout)
 
     def test_deploy_error_with_non_utf8_bytes_is_cut_without_failing(self):
@@ -835,16 +890,20 @@ class DeployMetadataTests(unittest.TestCase):
         )
         for name, files, expected in cases:
             with self.subTest(source=name):
-                stdout, env = self.run_metadata(**files)
+                stdout, env, metadata = self.run_metadata(**files)
                 # Cut by character; invalid bytes become U+FFFD so GitLab accepts the text.
                 self.assertEqual(env["DEPLOY_ERROR"], expected.decode("utf-8", "replace")[:200])
                 env["DEPLOY_ERROR"].encode("utf-8")
-                self.assertEqual((env["VERSION"], env["BUILD_NUMBER"]), ("unknown", "unknown"))
+                self.assertNotIn("VERSION", env)
+                self.assertNotIn("BUILD_NUMBER", env)
+                self.assertEqual(
+                    (metadata["version"], metadata["build_number"]), ("unknown", "unknown")
+                )
                 self.assert_only_masked(stdout, env["DEPLOY_ERROR"])
 
     def test_cut_never_splits_a_multibyte_character(self):
         line = "[!] " + "\u00e9" * 300
-        stdout, env = self.run_metadata(sanitized_log=line.encode("utf-8") + b"\n")
+        stdout, env, _ = self.run_metadata(sanitized_log=line.encode("utf-8") + b"\n")
         self.assertEqual(env["DEPLOY_ERROR"], line[:200])
 
     def test_headline_prefers_fastlane_summary_and_skips_build_number_line(self):
@@ -863,12 +922,14 @@ class DeployMetadataTests(unittest.TestCase):
         )
         for log, expected in cases:
             with self.subTest(expected=expected):
-                stdout, env = self.run_metadata(sanitized_log=log)
+                stdout, env, _ = self.run_metadata(sanitized_log=log)
                 self.assertEqual(env["DEPLOY_ERROR"], expected)
                 self.assert_only_masked(stdout, expected)
 
     def test_percent_in_error_is_escaped_for_the_mask_under_bash_3_2(self):
-        stdout, env = self.run_metadata(sanitized_log=b"[!] Synthetic 100% failure %0A\n")
+        stdout, env, _ = self.run_metadata(
+            sanitized_log=b"[!] Synthetic 100% failure %0A\n"
+        )
         self.assertEqual(env["DEPLOY_ERROR"], "[!] Synthetic 100% failure %0A")
         masks = [line for line in stdout.splitlines() if line.startswith("::add-mask::")]
         self.assertEqual(masks, ["::add-mask::[!] Synthetic 100%25 failure %250A"])
