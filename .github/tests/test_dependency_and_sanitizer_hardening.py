@@ -372,17 +372,22 @@ class BuildLogSanitizerTests(unittest.TestCase):
             (source / "test.log").write_bytes(log_bytes)
             if stale_excerpt is not None:
                 (source / "sanitized-log.txt").write_bytes(stale_excerpt)
-            prelude = ""
+            bin_dir = directory / "bin"
+            bin_dir.mkdir()
+            # Run the step's python3 selector with this interpreter, as on the runner.
+            write_executable(
+                bin_dir / "python3", f'#!/bin/sh\nexec "{Path(sys.executable).as_posix()}" "$@"\n'
+            )
             if failing_sed:
-                (directory / "bin").mkdir()
-                write_executable(directory / "bin" / "sed", STUB_FAILING_SED)
-                prelude = 'PATH="$(cd bin && pwd):$PATH"\nexport PATH\n'
+                write_executable(bin_dir / "sed", STUB_FAILING_SED)
+            prelude = 'PATH="$(cd bin && pwd):$PATH"\nexport PATH\n'
             (directory / "step.sh").write_bytes((prelude + script).encode("utf-8"))
             env = os.environ.copy()
             # Simulate the runner's UTF-8 locale; the step must not depend on it.
             env.update(
                 LANG="en_US.UTF-8",
                 LC_ALL="en_US.UTF-8",
+                MSYS_NO_PATHCONV="1",
                 SCHEME_NAME="SyntheticScheme",
                 BUNDLE_ID="com.example.synthetic",
                 TEAM_ID="SYNTHTEAM1",
