@@ -96,7 +96,7 @@
       "comment": "Quoted code-sign identity settings"
     },
     {
-      "match": "CODE_SIGN_IDENTITY *= *[^\")\\n]*",
+      "match": "CODE_SIGN_IDENTITY *= *[^\")]*",
       "replace": "CODE_SIGN_IDENTITY=<redacted>",
       "comment": "Unquoted code-sign identity settings, including multi-word values"
     },
@@ -116,7 +116,7 @@
       "comment": "Quoted provisioning profile specifiers"
     },
     {
-      "match": "PROVISIONING_PROFILE_SPECIFIER *= *[^\")\\n]*",
+      "match": "PROVISIONING_PROFILE_SPECIFIER *= *[^\")]*",
       "replace": "PROVISIONING_PROFILE_SPECIFIER=<redacted>",
       "comment": "Unquoted provisioning profile specifiers, including multi-word values"
     },
@@ -126,7 +126,7 @@
       "comment": "Quoted provisioning profile assignments"
     },
     {
-      "match": "PROVISIONING_PROFILE[^ =]* *= *[^\")\\n]*",
+      "match": "PROVISIONING_PROFILE[^ =]* *= *[^\")]*",
       "replace": "PROVISIONING_PROFILE=<redacted>",
       "comment": "Unquoted provisioning profile assignments, including multi-word values"
     },
@@ -146,7 +146,7 @@
       "comment": "Quoted build settings containing _SIGNING_"
     },
     {
-      "match": "([A-Z0-9_]*_SIGNING_[A-Z0-9_]*) *= *[^\")\\n]*",
+      "match": "([A-Z0-9_]*_SIGNING_[A-Z0-9_]*) *= *[^\")]*",
       "replace": "\\1=<redacted>",
       "comment": "Unquoted build settings containing _SIGNING_, including multi-word values"
     },
@@ -156,7 +156,7 @@
       "comment": "Quoted build settings containing _SIGN_"
     },
     {
-      "match": "([A-Z0-9_]*_SIGN_[A-Z0-9_]*) *= *[^\")\\n]*",
+      "match": "([A-Z0-9_]*_SIGN_[A-Z0-9_]*) *= *[^\")]*",
       "replace": "\\1=<redacted>",
       "comment": "Unquoted build settings containing _SIGN_, including multi-word values"
     },
@@ -166,7 +166,7 @@
       "comment": "Quoted Info.plist-derived build settings"
     },
     {
-      "match": "(INFOPLIST_KEY_[A-Z0-9_]+) *= *[^\")\\n]*",
+      "match": "(INFOPLIST_KEY_[A-Z0-9_]+) *= *[^\")]*",
       "replace": "\\1=<redacted>",
       "comment": "Unquoted Info.plist-derived build settings, including multi-word values"
     },
@@ -186,22 +186,22 @@
       "comment": "IPv4 addresses"
     },
     {
-      "match": "[[:alnum:]._%+-]+@[[:alnum:].-]+\\.[[:alpha:]]{2,}",
-      "replace": "<email>",
-      "comment": "Email addresses"
-    },
-    {
       "match": "https?://[^/@[:space:]]+:[^/@[:space:]]+@[^[:space:]\")]+",
       "replace": "<credentialed-url>",
       "comment": "Git or API URLs containing embedded credentials"
     },
     {
-      "match": "(Authorization: *(Bearer|Basic) )[A-Za-z0-9._~+/-=]+",
+      "match": "[[:alnum:]._%+-]+@[[:alnum:].-]+\\.[[:alpha:]]{2,}",
+      "replace": "<email>",
+      "comment": "Email addresses (after credentialed URLs to avoid partial redaction)"
+    },
+    {
+      "match": "(Authorization: *(Bearer|Basic) )[A-Za-z0-9._~+/=-]+",
       "replace": "\\1<redacted>",
       "comment": "Authorization headers"
     },
     {
-      "match": "((X-API-Key|X-Auth-Token|PRIVATE-TOKEN): *)[A-Za-z0-9._~+/-=]+",
+      "match": "((X-API-Key|X-Auth-Token|PRIVATE-TOKEN): *)[A-Za-z0-9._~+/=-]+",
       "replace": "\\1<redacted>",
       "comment": "API-key style headers"
     },
