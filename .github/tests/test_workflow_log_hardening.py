@@ -689,17 +689,29 @@ class DeployFailureReportingBehaviourTests(unittest.TestCase):
 
 class DeployMetadataTests(unittest.TestCase):
     def setUp(self):
-        self.step = steps(read(DEPLOY))["Extract deploy metadata"]
+        self.workflow = read(DEPLOY)
+        self.step = steps(self.workflow)["Extract deploy metadata"]
 
-    def test_values_are_masked_before_environment_export(self):
-        for variable, exported in (("build_number", "BUILD_NUMBER"), ("version", "VERSION")):
-            self.assertLess(
-                self.step.index(f'echo "::add-mask::${variable}"'),
-                self.step.index(f'echo "{exported}<<'),
-            )
-        for line in self.step.splitlines():
-            if "echo" in line and re.search(r"\$\{?(build_number|version)\b", line):
-                self.assertIn("::add-mask::", line)
+    def test_public_release_metadata_is_not_registered_as_a_mask(self):
+        self.assertNotIn('::add-mask::$build_number', self.step)
+        self.assertNotIn('::add-mask::$version', self.step)
+
+    def test_private_identifiers_and_signing_metadata_remain_masked(self):
+        for value in (
+            "$SOURCE_REPOSITORY_URL",
+            "${PROJECT_ID}",
+            "${SHA:0:12}",
+            "${REF}",
+            "$keychain_password",
+            "$profile_uuid",
+            "$profile_name",
+            "$profile_app_id",
+            "$expiration_date",
+            "$ASC_KEY_ID",
+            "$ASC_ISSUER_ID",
+        ):
+            with self.subTest(value=value):
+                self.assertIn(f'echo "::add-mask::{value}"', self.workflow)
 
     def test_loose_raw_log_patterns_are_gone(self):
         self.assertNotIn("Incrementing build number", self.step)
@@ -799,7 +811,8 @@ class DeployMetadataTests(unittest.TestCase):
             ),
         )
         self.assertEqual((env["VERSION"], env["BUILD_NUMBER"]), ("3.4.5", "678"))
-        self.assert_only_masked(stdout, "3.4.5", "678")
+        self.assertNotIn("::add-mask::3.4.5", stdout)
+        self.assertNotIn("::add-mask::678", stdout)
 
     def test_build_number_falls_back_to_anchored_agvtool_line(self):
         stdout, env = self.run_metadata(
@@ -811,7 +824,7 @@ class DeployMetadataTests(unittest.TestCase):
             )
         )
         self.assertEqual((env["VERSION"], env["BUILD_NUMBER"]), ("unknown", "42"))
-        self.assert_only_masked(stdout, "42")
+        self.assertNotIn("::add-mask::42", stdout)
         self.assertNotIn("::add-mask::unknown", stdout)
 
     def test_invalid_ipa_values_are_rejected(self):

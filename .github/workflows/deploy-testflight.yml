@@ -855,11 +855,6 @@ jobs:
           if [ -z "$build_number" ]; then build_number='unknown'; fi
           if [ -z "$version" ]; then version='unknown'; fi
 
-          # Mask before GITHUB_ENV: later env dumps in this public log must show *** for both.
-          # The unmasked values still reach the private SCM status and commit comment.
-          if [ "$build_number" != 'unknown' ]; then echo "::add-mask::$build_number"; fi
-          if [ "$version" != 'unknown' ]; then echo "::add-mask::$version"; fi
-
           deploy_error=''
           if [ -f deploy-sanitized.log ]; then
             # fastlane's own failure summary (its last "[!] ..." line) is the most specific headline.
@@ -899,6 +894,8 @@ jobs:
             echo "::add-mask::$masked_error"
           fi
 
+          # Build number and marketing version are public, low-entropy release metadata.
+          # Do not register them as masks: doing so corrupts unrelated public log output.
           {
             echo "BUILD_NUMBER<<__BUILD_NUMBER_EOF__"
             printf '%s' "$build_number"
